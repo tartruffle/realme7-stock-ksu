@@ -35,7 +35,7 @@ jobs:
           git clone --depth=1 -b kernel-4.14 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu || true
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
 
-      - name: Setup BakaSU & SuSFS
+      - name: Setup BakaSU, SuSFS & Fix GCC Host Compatibility
         working-directory: ./kernel
         run: |
           # 1. Clean old KSU if present
@@ -55,16 +55,22 @@ jobs:
             fi
           fi
 
-          # 4. Resolve Defconfig file
+          # 4. FIX: Patch dtc yylloc and enable -fcommon for host compiler (Ubuntu 22.04 GCC 11 fix)
+          sed -i 's/^YYLTYPE yylloc;/extern YYLTYPE yylloc;/g' scripts/dtc/dtc-lexer.lex.c_shipped 2>/dev/null || true
+          sed -i 's/^YYLTYPE yylloc;/extern YYLTYPE yylloc;/g' scripts/dtc/dtc-lexer.lex.c 2>/dev/null || true
+          sed -i 's/^YYLTYPE yylloc;/extern YYLTYPE yylloc;/g' scripts/dtc/dtc-lexer.l 2>/dev/null || true
+          sed -i 's/HOSTCFLAGS   :=/HOSTCFLAGS   := -fcommon /g' Makefile 2>/dev/null || true
+
+          # 5. Resolve Defconfig file
           CONF="${{ github.event.inputs.defconfig }}"
           [ ! -f "arch/arm64/configs/$CONF" ] && CONF="salaa_defconfig"
           echo "RESOLVED_DEFCONFIG=$CONF" >> $GITHUB_ENV
           DEFCONFIG_FILE="arch/arm64/configs/$CONF"
 
-          # 5. Disable -Werror
+          # 6. Disable -Werror
           sed -i 's/-Werror//g' Makefile arch/arm64/Makefile 2>/dev/null || true
 
-          # 6. Append Kconfig flags directly
+          # 7. Append Kconfig flags directly
           printf "\nCONFIG_KSU=y\nCONFIG_KPROBES=y\nCONFIG_HAVE_KPROBES=y\nCONFIG_KPROBE_EVENTS=y\nCONFIG_KALLSYMS=y\nCONFIG_KALLSYMS_ALL=y\nCONFIG_OVERLAY_FS=y\nCONFIG_KSU_SUSFS=y\nCONFIG_KSU_SUSFS_SUS_PATH=y\nCONFIG_KSU_SUSFS_SUS_MOUNT=y\nCONFIG_KSU_SUSFS_SUS_KSTAT=y\nCONFIG_KSU_SUSFS_TRY_UMOUNT=y\nCONFIG_KSU_SUSFS_SPOOF_UNAME=y\nCONFIG_KSU_SUSFS_ENABLE_LOG=y\n" >> "$DEFCONFIG_FILE"
 
       - name: Compile Kernel Image
@@ -80,6 +86,8 @@ jobs:
           make -j$(nproc --all) O=out \
             ARCH=arm64 \
             CC=clang \
+            HOSTCFLAGS="-O2 -fcommon" \
+            HOSTCXXFLAGS="-O2 -fcommon" \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
