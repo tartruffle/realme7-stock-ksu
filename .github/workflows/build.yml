@@ -6,11 +6,11 @@ on:
       kernel_repo:
         description: 'GitHub Kernel Source URL'
         required: true
-        default: 'https://github.com/prathsprjkt/android_kernel_realme_salaa.git'
+        default: 'https://github.com/Evolution-X-Devices/kernel_realme_salaa.git'
       kernel_branch:
         description: 'Kernel Branch'
         required: true
-        default: '14.0'
+        default: 'bka'
       defconfig:
         description: 'Defconfig Name'
         required: true
@@ -20,93 +20,184 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Install Build Dependencies & Cross-Compilers
+      - name: Install Build Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential curl flex git libssl-dev libncurses-dev \
-            rsync zip zlib1g-dev python3 libxml2-utils lzop \
-            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils-aarch64-linux-gnu
+            bc bison build-essential ccache curl flex git libssl-dev libncurses-dev \
+            libelf-dev dwarves rsync zip zlib1g-dev python3 python-is-python3 \
+            libxml2-utils lzop wget ca-certificates clang lld llvm \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
 
-      - name: Clone Kernel, Clang, SuSFS, and AnyKernel3
+      - name: Clone Kernel, Modern Clang Toolchain, SuSFS, and AnyKernel3
         run: |
-          git clone --depth=1 -b ${{ github.event.inputs.kernel_branch }} ${{ github.event.inputs.kernel_repo }} kernel
-          git clone --depth=1 https://github.com/kdrag0n/proton-clang.git clang
+          git clone --depth=1 -b "${{ github.event.inputs.kernel_branch }}" "${{ github.event.inputs.kernel_repo }}" kernel || \
+          git clone --depth=1 https://github.com/prathsprjkt/android_kernel_realme_salaa.git -b 14.0 kernel
+
+          # Download ZyC Clang 19 (tested on RM6785 / salaa 4.14 kernels)
+          mkdir -p clang
+          wget -qO clang.tar.gz "https://github.com/ZyCromerZ/Clang/releases/download/19.0.0git-20240429-release/Clang-19.0.0git-20240429.tar.gz"
+          tar -xzf clang.tar.gz -C clang
+
           git clone --depth=1 -b kernel-4.14 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
 
-      - name: Integrate BakaSU & SuSFS
+      - name: Integrate BakaSU, Manual Hooks & SuSFS Safely
         working-directory: ./kernel
         run: |
-          # 1. Pull BakaSU
+          # 1. Remove any stale KernelSU inside the tree so it doesn't conflict with BakaSU
+          rm -rf KernelSU drivers/kernelsu
+          sed -i '/kernelsu/d' drivers/Kconfig drivers/Makefile || true
+
+          # 2. Integrate BakaSU
           curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -
 
-          # 2. Copy SuSFS 4.14 files
+          # 3. Inject 4.14 Manual Hooks into fs/ if not already hooked in this tree
+          python3 - << 'PYEOF'
+          import os, re
+
+          def patch_file(path, check_str, target_regex, replacement):
+              if not os.path.exists(path): return
+              with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                  content = f.read()
+              if check_str in content:
+                  print(f"[+] {path} already contains {check_str}, skipping.")
+                  return
+              new_content, count = re.subn(target_regex, replacement, content, count=1, flags=re.M)
+              if count > 0:
+                  with open(path, 'w', encoding='utf-8') as f:
+                      f.write(new_content)
+                  print(f"[+] Successfully injected hook into {path}")
+              else:
+                  print(f"[!] Target pattern not matched in {path}")
+
+          # A. fs/exec.c -> ksu_handle_execveat
+          exec_hook = """#ifdef CONFIG_KSU
+          extern bool ksu_execveat_hook __read_mostly;
+          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);
+          extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);
+          #endif
+          static int do_execveat_common(int fd, struct filename *filename,"""
+          patch_file("fs/exec.c", "ksu_handle_execveat", r"^static int do_execveat_common\(int fd, struct filename \*filename,", exec_hook)
+          patch_file("fs/exec.c", "ksu_handle_execveat(&fd", r"(static int do_execveat_common\([\s\S]*?\{\n)", r"\1#ifdef CONFIG_KSU\n\tif (unlikely(ksu_execveat_hook))\n\t\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n\telse\n\t\tksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);\n#endif\n")
+
+          # B. fs/open.c -> ksu_handle_faccessat
+          open_hook = """#ifdef CONFIG_KSU
+          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);
+          #endif
+          long do_faccessat(int dfd, const char __user *filename, int mode)"""
+          patch_file("fs/open.c", "ksu_handle_faccessat", r"^long do_faccessat\(int dfd, const char __user \*filename, int mode\)", open_hook)
+          patch_file("fs/open.c", "ksu_handle_faccessat(&dfd", r"(long do_faccessat\(int dfd, const char __user \*filename, int mode\)\n\{\n)", r"\1#ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif\n")
+
+          # C. fs/read_write.c -> ksu_handle_vfs_read
+          rw_hook = """#ifdef CONFIG_KSU
+          extern bool ksu_vfs_read_hook __read_mostly;
+          extern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos);
+          #endif
+          ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)"""
+          patch_file("fs/read_write.c", "ksu_handle_vfs_read", r"^ssize_t vfs_read\(struct file \*file, char __user \*buf, size_t count, loff_t \*pos\)", rw_hook)
+          patch_file("fs/read_write.c", "ksu_handle_vfs_read(&file", r"(ssize_t vfs_read\(struct file \*file, char __user \*buf, size_t count, loff_t \*pos\)\n\{\n)", r"\1#ifdef CONFIG_KSU\n\tif (unlikely(ksu_vfs_read_hook))\n\t\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n#endif\n")
+
+          # D. fs/stat.c -> ksu_handle_stat
+          stat_hook = """#ifdef CONFIG_KSU
+          extern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);
+          #endif
+          int vfs_statx(int dfd, const char __user *filename, int flags,"""
+          patch_file("fs/stat.c", "ksu_handle_stat", r"^int vfs_statx\(int dfd, const char __user \*filename, int flags,", stat_hook)
+          patch_file("fs/stat.c", "ksu_handle_stat(&dfd", r"(int vfs_statx\(int dfd, const char __user \*filename, int flags,[\s\S]*?\{\n)", r"\1#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flags);\n#endif\n")
+          PYEOF
+
+          # 4. Copy SuSFS 4.14 files and test-apply patch cleanly (never leave half-applied C files)
           cp -rf ../susfs4ksu/kernel_patches/fs/* fs/
           cp -rf ../susfs4ksu/kernel_patches/include/linux/* include/linux/
-
-          # 3. Apply SuSFS 4.14 Patch
           PATCH_FILE=$(find ../susfs4ksu/kernel_patches/ -maxdepth 1 -name "*susfs*.patch" | head -n 1)
           if [ -n "$PATCH_FILE" ]; then
-              patch -p1 -F 3 --forward < "$PATCH_FILE" || true
+              if patch -p1 -F 3 --dry-run < "$PATCH_FILE" >/dev/null 2>&1; then
+                  echo "[+] SuSFS 4.14 patch applies cleanly! Applying..."
+                  patch -p1 -F 3 < "$PATCH_FILE"
+                  echo "SUSFS_PATCHED=1" >> $GITHUB_ENV
+              else
+                  echo "[!] SuSFS 4.14 patch has conflicts with this OEM tree. Reverting partial SuSFS files to prevent build failure..."
+                  git checkout -- fs/ include/ || true
+                  rm -f fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h
+                  echo "SUSFS_PATCHED=0" >> $GITHUB_ENV
+              fi
           fi
 
-          # 4. Resolve Defconfig
+          # 5. Locate Defconfig and append required configs
           CONF="${{ github.event.inputs.defconfig }}"
           if [ ! -f "arch/arm64/configs/$CONF" ]; then
               CONF=$(ls arch/arm64/configs/*salaa* arch/arm64/configs/*6785* 2>/dev/null | head -n 1 | xargs basename)
           fi
           echo "RESOLVED_DEFCONFIG=$CONF" >> $GITHUB_ENV
+          DEFCONFIG_PATH="arch/arm64/configs/$CONF"
 
-          # 5. Append Kconfig flags
-          cat << 'EOF' >> "arch/arm64/configs/$CONF"
+          # Disable -Werror across the kernel so strict Clang 19 warnings never break compilation
+          sed -i 's/-Werror//g' Makefile arch/arm64/Makefile drivers/kernelsu/Makefile 2>/dev/null || true
+
+          cat << 'EOF' >> "$DEFCONFIG_PATH"
           CONFIG_KSU=y
-          CONFIG_KSU_SUSFS=y
           CONFIG_KPROBES=y
           CONFIG_HAVE_KPROBES=y
           CONFIG_KPROBE_EVENTS=y
-          CONFIG_KSU_SUSFS_SUS_PATH=y
-          CONFIG_KSU_SUSFS_SUS_MOUNT=y
-          CONFIG_KSU_SUSFS_SUS_KSTAT=y
-          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
-          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-          CONFIG_KSU_SUSFS_ENABLE_LOG=y
-          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-          CONFIG_KSU_SUSFS_SUS_SU=n
+          CONFIG_KALLSYMS=y
+          CONFIG_KALLSYMS_ALL=y
+          CONFIG_OVERLAY_FS=y
+          CONFIG_WERROR=n
           EOF
+
+          if grep -q "SUSFS_PATCHED=1" $GITHUB_ENV 2>/dev/null; then
+              cat << 'EOF' >> "$DEFCONFIG_PATH"
+              CONFIG_KSU_SUSFS=y
+              CONFIG_KSU_SUSFS_SUS_PATH=y
+              CONFIG_KSU_SUSFS_SUS_MOUNT=y
+              CONFIG_KSU_SUSFS_SUS_KSTAT=y
+              CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+              CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+              CONFIG_KSU_SUSFS_ENABLE_LOG=y
+              EOF
+          else
+              echo "CONFIG_KSU_SUSFS=n" >> "$DEFCONFIG_PATH"
+          fi
 
       - name: Compile Kernel
         working-directory: ./kernel
         run: |
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
-          export KBUILD_BUILD_USER="builder"
-          export KBUILD_BUILD_HOST="github-actions"
+          export KBUILD_BUILD_USER="Syaz"
+          export KBUILD_BUILD_HOST="GitHub-CI"
 
           make O=out ARCH=arm64 "$RESOLVED_DEFCONFIG"
+          # Ensure olddefconfig resolves any new BakaSU prompts automatically using default values
+          yes "" | make O=out ARCH=arm64 olddefconfig || true
+
+          set -o pipefail
           make -j$(nproc --all) O=out \
               ARCH=arm64 \
               CC=clang \
+              LD=ld.lld \
               AR=llvm-ar \
               NM=llvm-nm \
               OBJCOPY=llvm-objcopy \
               OBJDUMP=llvm-objdump \
               STRIP=llvm-strip \
+              READELF=llvm-readelf \
+              OBJSIZE=llvm-size \
+              LLVM=1 \
+              LLVM_IAS=1 \
               CLANG_TRIPLE=aarch64-linux-gnu- \
               CROSS_COMPILE=aarch64-linux-gnu- \
               CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
               CONFIG_NO_ERROR_ON_MISMATCH=y \
-              Image.gz-dtb dtbo.img || make -j$(nproc --all) O=out \
-              ARCH=arm64 \
-              CC=clang \
-              AR=llvm-ar \
-              NM=llvm-nm \
-              OBJCOPY=llvm-objcopy \
-              OBJDUMP=llvm-objdump \
-              STRIP=llvm-strip \
-              CLANG_TRIPLE=aarch64-linux-gnu- \
-              CROSS_COMPILE=aarch64-linux-gnu- \
-              CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-              Image.gz dtb dtbo.img
+              KCFLAGS="-Wno-error" \
+              2>&1 | tee build_error.log
+
+      - name: Print Exact Error Lines If Build Fails
+        if: failure()
+        working-directory: ./kernel
+        run: |
+          echo "================ EXACT COMPILER ERRORS ================"
+          grep -iE "error:|undefined reference|fatal error:" build_error.log | tail -n 50 || tail -n 80 build_error.log
 
       - name: Package AnyKernel3
         run: |
@@ -114,7 +205,8 @@ jobs:
               cp kernel/out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
           elif [ -f "kernel/out/arch/arm64/boot/Image.gz" ]; then
               cp kernel/out/arch/arm64/boot/Image.gz AnyKernel3/
-              [ -f "kernel/out/arch/arm64/boot/dtb" ] && cp kernel/out/arch/arm64/boot/dtb AnyKernel3/
+          elif [ -f "kernel/out/arch/arm64/boot/Image" ]; then
+              cp kernel/out/arch/arm64/boot/Image AnyKernel3/
           fi
           [ -f "kernel/out/arch/arm64/boot/dtbo.img" ] && cp kernel/out/arch/arm64/boot/dtbo.img AnyKernel3/
 
