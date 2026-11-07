@@ -35,7 +35,7 @@ jobs:
           git clone --depth=1 -b kernel-4.14 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu || true
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
 
-      - name: Setup BakaSU, SuSFS & Fix GCC Host Compatibility
+      - name: Setup BakaSU, SuSFS & Fix GCC 11 Compatibility
         working-directory: ./kernel
         run: |
           # 1. Clean old KSU if present
@@ -55,11 +55,11 @@ jobs:
             fi
           fi
 
-          # 4. FIX: Patch dtc yylloc and enable -fcommon for host compiler (Ubuntu 22.04 GCC 11 fix)
-          sed -i 's/^YYLTYPE yylloc;/extern YYLTYPE yylloc;/g' scripts/dtc/dtc-lexer.lex.c_shipped 2>/dev/null || true
-          sed -i 's/^YYLTYPE yylloc;/extern YYLTYPE yylloc;/g' scripts/dtc/dtc-lexer.lex.c 2>/dev/null || true
-          sed -i 's/^YYLTYPE yylloc;/extern YYLTYPE yylloc;/g' scripts/dtc/dtc-lexer.l 2>/dev/null || true
-          sed -i 's/HOSTCFLAGS   :=/HOSTCFLAGS   := -fcommon /g' Makefile 2>/dev/null || true
+          # 4. FIX: Safely append -fcommon to host compiler flags in the Makefile
+          sed -i 's/HOSTCFLAGS   =/HOSTCFLAGS   = -fcommon /g' Makefile
+          sed -i 's/HOSTCFLAGS  =/HOSTCFLAGS  = -fcommon /g' Makefile
+          # Forcefully change YYLTYPE yylloc to extern in all flex scanner files
+          find scripts/dtc -type f -name "*.c" -o -name "*.c_shipped" -o -name "*.l" | xargs sed -i 's/YYLTYPE yylloc;/extern YYLTYPE yylloc;/g' || true
 
           # 5. Resolve Defconfig file
           CONF="${{ github.event.inputs.defconfig }}"
@@ -83,11 +83,10 @@ jobs:
           make O=out ARCH=arm64 "$RESOLVED_DEFCONFIG"
           yes "" | make O=out ARCH=arm64 olddefconfig >/dev/null 2>&1 || true
 
+          # Clean make execution without overriding host flags
           make -j$(nproc --all) O=out \
             ARCH=arm64 \
             CC=clang \
-            HOSTCFLAGS="-O2 -fcommon" \
-            HOSTCXXFLAGS="-O2 -fcommon" \
             CLANG_TRIPLE=aarch64-linux-gnu- \
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
