@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       kernel_repo:
-        description: 'GitHub Kernel Source URL'
+        description: 'Kernel Source URL'
         required: true
         default: 'https://github.com/prathsprjkt/android_kernel_realme_salaa.git'
       kernel_branch:
@@ -12,7 +12,7 @@ on:
         required: true
         default: '14.0'
       defconfig:
-        description: 'Defconfig Name'
+        description: 'Defconfig'
         required: true
         default: 'salaa_defconfig'
 
@@ -25,95 +25,58 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             bc bison build-essential curl flex git libssl-dev libncurses-dev \
-            libelf-dev dwarves rsync zip zlib1g-dev python3 python-is-python3 \
-            libxml2-utils lzop wget ca-certificates \
-            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
+            libelf-dev dwarves rsync zip zlib1g-dev python3 libxml2-utils lzop \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
 
-      - name: Clone Kernel, Clang, SuSFS, and AnyKernel3
+      - name: Clone Sources & Toolchain
         run: |
           git clone --depth=1 -b "${{ github.event.inputs.kernel_branch }}" "${{ github.event.inputs.kernel_repo }}" kernel
           git clone --depth=1 https://github.com/kdrag0n/proton-clang.git clang
           git clone --depth=1 -b kernel-4.14 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu || true
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
 
-      - name: Integrate BakaSU and SuSFS Safely
+      - name: Setup BakaSU & SuSFS
         working-directory: ./kernel
         run: |
-          # 1. Clean any existing KernelSU in the tree
+          # 1. Clean old KSU if present
           rm -rf KernelSU drivers/kernelsu
           sed -i '/kernelsu/d' drivers/Kconfig drivers/Makefile 2>/dev/null || true
 
-          # 2. Run official BakaSU setup script
+          # 2. Run BakaSU official setup
           curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -
 
-          # 3. Apply SuSFS 4.14 files only if patch applies cleanly (dry-run test)
+          # 3. Integrate SuSFS files and test-apply 4.14 patch
           if [ -d "../susfs4ksu/kernel_patches" ]; then
+            cp -rf ../susfs4ksu/kernel_patches/fs/* fs/ 2>/dev/null || true
+            cp -rf ../susfs4ksu/kernel_patches/include/linux/* include/linux/ 2>/dev/null || true
             PATCH_FILE=$(find ../susfs4ksu/kernel_patches/ -maxdepth 1 -name "*susfs*.patch" | head -n 1)
-            if [ -n "$PATCH_FILE" ] && patch -p1 --dry-run < "$PATCH_FILE" >/dev/null 2>&1; then
-              echo "[+] SuSFS patch applies cleanly. Integrating..."
-              cp -rf ../susfs4ksu/kernel_patches/fs/* fs/ 2>/dev/null || true
-              cp -rf ../susfs4ksu/kernel_patches/include/linux/* include/linux/ 2>/dev/null || true
-              patch -p1 < "$PATCH_FILE"
-              echo "SUSFS_ENABLED=1" >> $GITHUB_ENV
-            else
-              echo "[!] SuSFS 4.14 patch had conflicts with this tree. Skipping patch to prevent build failures."
-              echo "SUSFS_ENABLED=0" >> $GITHUB_ENV
+            if [ -n "$PATCH_FILE" ]; then
+              patch -p1 -F 3 --forward < "$PATCH_FILE" || true
             fi
           fi
 
-          # 4. Resolve Defconfig
+          # 4. Resolve Defconfig file
           CONF="${{ github.event.inputs.defconfig }}"
-          if [ ! -f "arch/arm64/configs/$CONF" ]; then
-            for f in arch/arm64/configs/*salaa* arch/arm64/configs/*6785*; do
-              if [ -f "$f" ]; then
-                CONF=$(basename "$f")
-                break
-              fi
-            done
-          fi
+          [ ! -f "arch/arm64/configs/$CONF" ] && CONF="salaa_defconfig"
           echo "RESOLVED_DEFCONFIG=$CONF" >> $GITHUB_ENV
-          DEFCONFIG_PATH="arch/arm64/configs/$CONF"
+          DEFCONFIG_FILE="arch/arm64/configs/$CONF"
 
-          # 5. Disable -Werror so compiler warnings do not halt the build
+          # 5. Disable -Werror
           sed -i 's/-Werror//g' Makefile arch/arm64/Makefile 2>/dev/null || true
 
-          # 6. Append KSU & Kprobes configuration
-          cat << 'EOF' >> "$DEFCONFIG_PATH"
-          CONFIG_KSU=y
-          CONFIG_KPROBES=y
-          CONFIG_HAVE_KPROBES=y
-          CONFIG_KPROBE_EVENTS=y
-          CONFIG_KALLSYMS=y
-          CONFIG_KALLSYMS_ALL=y
-          CONFIG_OVERLAY_FS=y
-          EOF
+          # 6. Append Kconfig flags directly
+          printf "\nCONFIG_KSU=y\nCONFIG_KPROBES=y\nCONFIG_HAVE_KPROBES=y\nCONFIG_KPROBE_EVENTS=y\nCONFIG_KALLSYMS=y\nCONFIG_KALLSYMS_ALL=y\nCONFIG_OVERLAY_FS=y\nCONFIG_KSU_SUSFS=y\nCONFIG_KSU_SUSFS_SUS_PATH=y\nCONFIG_KSU_SUSFS_SUS_MOUNT=y\nCONFIG_KSU_SUSFS_SUS_KSTAT=y\nCONFIG_KSU_SUSFS_TRY_UMOUNT=y\nCONFIG_KSU_SUSFS_SPOOF_UNAME=y\nCONFIG_KSU_SUSFS_ENABLE_LOG=y\n" >> "$DEFCONFIG_FILE"
 
-          if [ "$SUSFS_ENABLED" = "1" ]; then
-            cat << 'EOF' >> "$DEFCONFIG_PATH"
-            CONFIG_KSU_SUSFS=y
-            CONFIG_KSU_SUSFS_SUS_PATH=y
-            CONFIG_KSU_SUSFS_SUS_MOUNT=y
-            CONFIG_KSU_SUSFS_SUS_KSTAT=y
-            CONFIG_KSU_SUSFS_TRY_UMOUNT=y
-            CONFIG_KSU_SUSFS_SPOOF_UNAME=y
-            CONFIG_KSU_SUSFS_ENABLE_LOG=y
-          EOF
-          fi
-
-      - name: Compile Kernel
+      - name: Compile Kernel Image
         working-directory: ./kernel
         run: |
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
           export KBUILD_BUILD_USER="Syaz"
           export KBUILD_BUILD_HOST="GitHub-CI"
 
-          # Prepare defconfig
           make O=out ARCH=arm64 "$RESOLVED_DEFCONFIG"
           yes "" | make O=out ARCH=arm64 olddefconfig >/dev/null 2>&1 || true
 
-          # Compile explicitly targeting Image.gz-dtb
-          # Store build log outside the repository so cleanups cannot erase it
-          set -o pipefail
           make -j$(nproc --all) O=out \
             ARCH=arm64 \
             CC=clang \
@@ -121,30 +84,11 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             CONFIG_NO_ERROR_ON_MISMATCH=y \
-            KCFLAGS="-Wno-error" \
-            Image.gz-dtb 2>&1 | tee "$GITHUB_WORKSPACE/build_error.log"
+            Image.gz-dtb
 
-      - name: Print Exact Error Lines If Build Fails
-        if: failure()
+      - name: Package AnyKernel3 Zip
         run: |
-          if [ -f "$GITHUB_WORKSPACE/build_error.log" ]; then
-            echo "================ EXACT COMPILER ERRORS ================"
-            grep -iE "error:|fatal error:|undefined reference" "$GITHUB_WORKSPACE/build_error.log" | tail -n 50 || tail -n 80 "$GITHUB_WORKSPACE/build_error.log"
-          fi
-
-      - name: Package AnyKernel3
-        run: |
-          if [ -f "kernel/out/arch/arm64/boot/Image.gz-dtb" ]; then
-            cp kernel/out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
-          elif [ -f "kernel/out/arch/arm64/boot/Image.gz" ]; then
-            cp kernel/out/arch/arm64/boot/Image.gz AnyKernel3/
-          elif [ -f "kernel/out/arch/arm64/boot/Image" ]; then
-            cp kernel/out/arch/arm64/boot/Image AnyKernel3/
-          fi
-          if [ -f "kernel/out/arch/arm64/boot/dtbo.img" ]; then
-            cp kernel/out/arch/arm64/boot/dtbo.img AnyKernel3/
-          fi
-
+          cp kernel/out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
           cd AnyKernel3
           sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
           sed -i 's|block=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;|block=auto;|g' anykernel.sh
@@ -152,7 +96,7 @@ jobs:
           rm -rf .git
           zip -r9 ../BakaSU-SuSFS-salaa.zip * -x README.md
 
-      - name: Upload Flashable Zip Artifact
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: BakaSU-SuSFS-salaa-Kernel
