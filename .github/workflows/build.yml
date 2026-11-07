@@ -10,7 +10,7 @@ on:
       kernel_branch:
         description: 'Kernel Branch'
         required: true
-        default: '14'
+        default: '14.0'
       defconfig:
         description: 'Defconfig Name'
         required: true
@@ -20,12 +20,13 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-      - name: Install Build Dependencies
+      - name: Install Build Dependencies & Cross-Compilers
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             bc bison build-essential curl flex git libssl-dev libncurses-dev \
-            rsync zip zlib1g-dev python3 libxml2-utils lzop
+            rsync zip zlib1g-dev python3 libxml2-utils lzop \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils-aarch64-linux-gnu
 
       - name: Clone Kernel, Clang, SuSFS, and AnyKernel3
         run: |
@@ -50,8 +51,15 @@ jobs:
               patch -p1 -F 3 --forward < "$PATCH_FILE" || true
           fi
 
-          # 4. Append Kconfig flags
-          cat << 'EOF' >> arch/arm64/configs/${{ github.event.inputs.defconfig }}
+          # 4. Resolve Defconfig
+          CONF="${{ github.event.inputs.defconfig }}"
+          if [ ! -f "arch/arm64/configs/$CONF" ]; then
+              CONF=$(ls arch/arm64/configs/*salaa* arch/arm64/configs/*6785* 2>/dev/null | head -n 1 | xargs basename)
+          fi
+          echo "RESOLVED_DEFCONFIG=$CONF" >> $GITHUB_ENV
+
+          # 5. Append Kconfig flags
+          cat << 'EOF' >> "arch/arm64/configs/$CONF"
           CONFIG_KSU=y
           CONFIG_KSU_SUSFS=y
           CONFIG_KPROBES=y
@@ -63,13 +71,18 @@ jobs:
           CONFIG_KSU_SUSFS_TRY_UMOUNT=y
           CONFIG_KSU_SUSFS_SPOOF_UNAME=y
           CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_SU=n
           EOF
 
       - name: Compile Kernel
         working-directory: ./kernel
         run: |
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
-          make O=out ARCH=arm64 ${{ github.event.inputs.defconfig }}
+          export KBUILD_BUILD_USER="builder"
+          export KBUILD_BUILD_HOST="github-actions"
+
+          make O=out ARCH=arm64 "$RESOLVED_DEFCONFIG"
           make -j$(nproc --all) O=out \
               ARCH=arm64 \
               CC=clang \
@@ -78,14 +91,33 @@ jobs:
               OBJCOPY=llvm-objcopy \
               OBJDUMP=llvm-objdump \
               STRIP=llvm-strip \
+              CLANG_TRIPLE=aarch64-linux-gnu- \
               CROSS_COMPILE=aarch64-linux-gnu- \
               CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-              Image.gz-dtb dtbo.img
+              CONFIG_NO_ERROR_ON_MISMATCH=y \
+              Image.gz-dtb dtbo.img || make -j$(nproc --all) O=out \
+              ARCH=arm64 \
+              CC=clang \
+              AR=llvm-ar \
+              NM=llvm-nm \
+              OBJCOPY=llvm-objcopy \
+              OBJDUMP=llvm-objdump \
+              STRIP=llvm-strip \
+              CLANG_TRIPLE=aarch64-linux-gnu- \
+              CROSS_COMPILE=aarch64-linux-gnu- \
+              CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+              Image.gz dtb dtbo.img
 
       - name: Package AnyKernel3
         run: |
-          cp kernel/out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
+          if [ -f "kernel/out/arch/arm64/boot/Image.gz-dtb" ]; then
+              cp kernel/out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
+          elif [ -f "kernel/out/arch/arm64/boot/Image.gz" ]; then
+              cp kernel/out/arch/arm64/boot/Image.gz AnyKernel3/
+              [ -f "kernel/out/arch/arm64/boot/dtb" ] && cp kernel/out/arch/arm64/boot/dtb AnyKernel3/
+          fi
           [ -f "kernel/out/arch/arm64/boot/dtbo.img" ] && cp kernel/out/arch/arm64/boot/dtbo.img AnyKernel3/
+
           cd AnyKernel3
           sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
           sed -i 's|block=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;|block=auto;|g' anykernel.sh
