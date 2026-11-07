@@ -6,11 +6,11 @@ on:
       kernel_repo:
         description: 'GitHub Kernel Source URL'
         required: true
-        default: 'https://github.com/Evolution-X-Devices/kernel_realme_salaa.git'
+        default: 'https://github.com/prathsprjkt/android_kernel_realme_salaa.git'
       kernel_branch:
         description: 'Kernel Branch'
         required: true
-        default: 'bka'
+        default: '14.0'
       defconfig:
         description: 'Defconfig Name'
         required: true
@@ -24,51 +24,44 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bc bison build-essential ccache curl flex git libssl-dev libncurses-dev \
-            libelf-dev dwarves rsync zip zlib1g-dev python3 python-is-python3 perl \
+            bc bison build-essential curl flex git libssl-dev libncurses-dev \
+            libelf-dev dwarves rsync zip zlib1g-dev python3 python-is-python3 \
             libxml2-utils lzop wget ca-certificates \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi
 
       - name: Clone Kernel, Clang, SuSFS, and AnyKernel3
         run: |
-          git clone --depth=1 -b "${{ github.event.inputs.kernel_branch }}" "${{ github.event.inputs.kernel_repo }}" kernel || \
-          git clone --depth=1 -b 14.0 https://github.com/prathsprjkt/android_kernel_realme_salaa.git kernel
+          git clone --depth=1 -b "${{ github.event.inputs.kernel_branch }}" "${{ github.event.inputs.kernel_repo }}" kernel
           git clone --depth=1 https://github.com/kdrag0n/proton-clang.git clang
           git clone --depth=1 -b kernel-4.14 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu || true
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
 
-      - name: Integrate BakaSU & Hooks
+      - name: Integrate BakaSU and SuSFS Safely
         working-directory: ./kernel
         run: |
-          set +e
-          touch build_error.log
-
-          # 1. Clean any pre-existing KernelSU in the tree
+          # 1. Clean any existing KernelSU in the tree
           rm -rf KernelSU drivers/kernelsu
-          sed -i '/kernelsu/d' drivers/Kconfig drivers/Makefile 2>/dev/null
+          sed -i '/kernelsu/d' drivers/Kconfig drivers/Makefile 2>/dev/null || true
 
           # 2. Run official BakaSU setup script
           curl -LSs "https://raw.githubusercontent.com/Baka-SU/BakaSU/main/kernel/setup.sh" | bash -
 
-          # 3. Inject 4.14 manual hooks using indentation-safe perl one-liners
-          if ! grep -q "ksu_handle_execveat" fs/exec.c 2>/dev/null; then
-            perl -0777 -pi -e 's/(static int do_execveat_common\(int fd, struct filename \*filename,)/#ifdef CONFIG_KSU\nextern bool ksu_execveat_hook __read_mostly;\nextern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\nextern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr, void *argv, void *envp, int *flags);\n#endif\n$1/s' fs/exec.c
-            perl -0777 -pi -e 's/(static int do_execveat_common\([^\{]+\{\n)/$1#ifdef CONFIG_KSU\n\tif (unlikely(ksu_execveat_hook))\n\t\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);\n\telse\n\t\tksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);\n#endif\n/s' fs/exec.c
+          # 3. Apply SuSFS 4.14 files only if patch applies cleanly (dry-run test)
+          if [ -d "../susfs4ksu/kernel_patches" ]; then
+            PATCH_FILE=$(find ../susfs4ksu/kernel_patches/ -maxdepth 1 -name "*susfs*.patch" | head -n 1)
+            if [ -n "$PATCH_FILE" ] && patch -p1 --dry-run < "$PATCH_FILE" >/dev/null 2>&1; then
+              echo "[+] SuSFS patch applies cleanly. Integrating..."
+              cp -rf ../susfs4ksu/kernel_patches/fs/* fs/ 2>/dev/null || true
+              cp -rf ../susfs4ksu/kernel_patches/include/linux/* include/linux/ 2>/dev/null || true
+              patch -p1 < "$PATCH_FILE"
+              echo "SUSFS_ENABLED=1" >> $GITHUB_ENV
+            else
+              echo "[!] SuSFS 4.14 patch had conflicts with this tree. Skipping patch to prevent build failures."
+              echo "SUSFS_ENABLED=0" >> $GITHUB_ENV
+            fi
           fi
 
-          if ! grep -q "ksu_handle_faccessat" fs/open.c 2>/dev/null; then
-            perl -0777 -pi -e 's/(long do_faccessat\(int dfd, const char __user \*filename, int mode\)\n\{\n)/#ifdef CONFIG_KSU\nextern int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *flags);\n#endif\n$1#ifdef CONFIG_KSU\n\tksu_handle_faccessat(&dfd, &filename, &mode, NULL);\n#endif\n/s' fs/open.c
-          fi
-
-          if ! grep -q "ksu_handle_vfs_read" fs/read_write.c 2>/dev/null; then
-            perl -0777 -pi -e 's/(ssize_t vfs_read\(struct file \*file, char __user \*buf, size_t count, loff_t \*pos\)\n\{\n)/#ifdef CONFIG_KSU\nextern bool ksu_vfs_read_hook __read_mostly;\nextern int ksu_handle_vfs_read(struct file **file_ptr, char __user **buf_ptr, size_t *count_ptr, loff_t **pos);\n#endif\n$1#ifdef CONFIG_KSU\n\tif (unlikely(ksu_vfs_read_hook))\n\t\tksu_handle_vfs_read(&file, &buf, &count, &pos);\n#endif\n/s' fs/read_write.c
-          fi
-
-          if ! grep -q "ksu_handle_stat" fs/stat.c 2>/dev/null; then
-            perl -0777 -pi -e 's/(int vfs_statx\(int dfd, const char __user \*filename, int flags,[^\{]+\{\n)/#ifdef CONFIG_KSU\nextern int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);\n#endif\n$1#ifdef CONFIG_KSU\n\tksu_handle_stat(&dfd, &filename, &flags);\n#endif\n/s' fs/stat.c
-          fi
-
-          # 4. Locate valid defconfig
+          # 4. Resolve Defconfig
           CONF="${{ github.event.inputs.defconfig }}"
           if [ ! -f "arch/arm64/configs/$CONF" ]; then
             for f in arch/arm64/configs/*salaa* arch/arm64/configs/*6785*; do
@@ -78,119 +71,65 @@ jobs:
               fi
             done
           fi
-          echo "RESOLVED_DEFCONFIG=$CONF" >> "$GITHUB_ENV"
+          echo "RESOLVED_DEFCONFIG=$CONF" >> $GITHUB_ENV
+          DEFCONFIG_PATH="arch/arm64/configs/$CONF"
 
-          # 5. Strip -Werror so compiler warnings never halt the build
-          sed -i 's/-Werror//g' Makefile arch/arm64/Makefile 2>/dev/null
-          find KernelSU -name "Makefile" -o -name "Kbuild" 2>/dev/null | xargs sed -i 's/-Werror//g' 2>/dev/null
+          # 5. Disable -Werror so compiler warnings do not halt the build
+          sed -i 's/-Werror//g' Makefile arch/arm64/Makefile 2>/dev/null || true
 
-          # Save a clean snapshot of BakaSU + Manual Hooks before testing SuSFS patch
-          git add -A
-          git -c user.name="CI" -c user.email="ci@example.com" commit -m "snapshot-bakasu-base" >/dev/null 2>&1
-          set -e
+          # 6. Append KSU & Kprobes configuration
+          cat << 'EOF' >> "$DEFCONFIG_PATH"
+          CONFIG_KSU=y
+          CONFIG_KPROBES=y
+          CONFIG_HAVE_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_KALLSYMS=y
+          CONFIG_KALLSYMS_ALL=y
+          CONFIG_OVERLAY_FS=y
+          EOF
 
-      - name: Compile Kernel (With Auto Self-Heal)
+          if [ "$SUSFS_ENABLED" = "1" ]; then
+            cat << 'EOF' >> "$DEFCONFIG_PATH"
+            CONFIG_KSU_SUSFS=y
+            CONFIG_KSU_SUSFS_SUS_PATH=y
+            CONFIG_KSU_SUSFS_SUS_MOUNT=y
+            CONFIG_KSU_SUSFS_SUS_KSTAT=y
+            CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+            CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+            CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          EOF
+          fi
+
+      - name: Compile Kernel
         working-directory: ./kernel
         run: |
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
           export KBUILD_BUILD_USER="Syaz"
           export KBUILD_BUILD_HOST="GitHub-CI"
-          DEFCONFIG_PATH="arch/arm64/configs/$RESOLVED_DEFCONFIG"
 
-          build_kernel() {
-            rm -rf out
-            make O=out ARCH=arm64 "$RESOLVED_DEFCONFIG"
-            yes "" | make O=out ARCH=arm64 olddefconfig >/dev/null 2>&1 || true
-            set -o pipefail
-            make -j$(nproc --all) O=out \
-              ARCH=arm64 \
-              CC=clang \
-              AR=llvm-ar \
-              NM=llvm-nm \
-              OBJCOPY=llvm-objcopy \
-              OBJDUMP=llvm-objdump \
-              STRIP=llvm-strip \
-              CLANG_TRIPLE=aarch64-linux-gnu- \
-              CROSS_COMPILE=aarch64-linux-gnu- \
-              CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-              CONFIG_NO_ERROR_ON_MISMATCH=y \
-              KCFLAGS="-Wno-error" 2>&1 | tee build_error.log
-          }
+          # Prepare defconfig
+          make O=out ARCH=arm64 "$RESOLVED_DEFCONFIG"
+          yes "" | make O=out ARCH=arm64 olddefconfig >/dev/null 2>&1 || true
 
-          echo "=== ATTEMPT 1: Compiling with BakaSU + SuSFS ==="
-          set +e
-          if [ -d "../susfs4ksu/kernel_patches" ]; then
-            cp -rf ../susfs4ksu/kernel_patches/fs/* fs/ 2>/dev/null
-            cp -rf ../susfs4ksu/kernel_patches/include/linux/* include/linux/ 2>/dev/null
-            PATCH_FILE=$(find ../susfs4ksu/kernel_patches/ -maxdepth 1 -name "*susfs*.patch" | head -n 1)
-            if [ -n "$PATCH_FILE" ]; then
-              patch -p1 -F 3 --forward < "$PATCH_FILE" || true
-            fi
-          fi
-
-          echo "CONFIG_KSU=y" >> "$DEFCONFIG_PATH"
-          echo "CONFIG_KSU_MANUAL_HOOK=y" >> "$DEFCONFIG_PATH"
-          echo "CONFIG_KPROBES=y" >> "$DEFCONFIG_PATH"
-          echo "CONFIG_HAVE_KPROBES=y" >> "$DEFCONFIG_PATH"
-          echo "CONFIG_KPROBE_EVENTS=y" >> "$DEFCONFIG_PATH"
-          echo "CONFIG_KALLSYMS=y" >> "$DEFCONFIG_PATH"
-          echo "CONFIG_KALLSYMS_ALL=y" >> "$DEFCONFIG_PATH"
-          echo "CONFIG_KSU_SUSFS=y" >> "$DEFCONFIG_PATH"
-          echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "$DEFCONFIG_PATH"
-          echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "$DEFCONFIG_PATH"
-          echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "$DEFCONFIG_PATH"
-          echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "$DEFCONFIG_PATH"
-          echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "$DEFCONFIG_PATH"
-
-          build_kernel
-          BUILD_STATUS=$?
-
-          if [ $BUILD_STATUS -ne 0 ] || [ ! -f "out/arch/arm64/boot/Image.gz-dtb" -a ! -f "out/arch/arm64/boot/Image.gz" ]; then
-            echo "=== ATTEMPT 1 FAILED (SuSFS 4.14 patch conflict). AUTO-HEALING TO ATTEMPT 2: BakaSU + Manual Hooks ==="
-            git reset --hard HEAD
-            git clean -fd
-            echo "CONFIG_KSU=y" >> "$DEFCONFIG_PATH"
-            echo "CONFIG_KSU_MANUAL_HOOK=y" >> "$DEFCONFIG_PATH"
-            echo "CONFIG_KSU_SUSFS=n" >> "$DEFCONFIG_PATH"
-            echo "CONFIG_KPROBES=y" >> "$DEFCONFIG_PATH"
-            echo "CONFIG_HAVE_KPROBES=y" >> "$DEFCONFIG_PATH"
-            echo "CONFIG_KPROBE_EVENTS=y" >> "$DEFCONFIG_PATH"
-            echo "CONFIG_KALLSYMS=y" >> "$DEFCONFIG_PATH"
-            echo "CONFIG_KALLSYMS_ALL=y" >> "$DEFCONFIG_PATH"
-
-            build_kernel
-            BUILD_STATUS=$?
-          fi
-
-          if [ $BUILD_STATUS -ne 0 ] || [ ! -f "out/arch/arm64/boot/Image.gz-dtb" -a ! -f "out/arch/arm64/boot/Image.gz" ]; then
-            echo "=== ATTEMPT 2 FAILED. AUTO-HEALING TO ATTEMPT 3: BakaSU Kprobes Mode ==="
-            git reset --hard HEAD
-            git clean -fd
-            git checkout HEAD~1 -- fs/ 2>/dev/null || true
-            echo "CONFIG_KSU=y" >> "$DEFCONFIG_PATH"
-            echo "CONFIG_KSU_MANUAL_HOOK=n" >> "$DEFCONFIG_PATH"
-            echo "CONFIG_KSU_SUSFS=n" >> "$DEFCONFIG_PATH"
-            echo "CONFIG_KPROBES=y" >> "$DEFCONFIG_PATH"
-            echo "CONFIG_HAVE_KPROBES=y" >> "$DEFCONFIG_PATH"
-            echo "CONFIG_KPROBE_EVENTS=y" >> "$DEFCONFIG_PATH"
-            echo "CONFIG_KALLSYMS=y" >> "$DEFCONFIG_PATH"
-            echo "CONFIG_KALLSYMS_ALL=y" >> "$DEFCONFIG_PATH"
-
-            build_kernel
-            BUILD_STATUS=$?
-          fi
-
-          set -e
-          exit $BUILD_STATUS
+          # Compile explicitly targeting Image.gz-dtb
+          # Store build log outside the repository so cleanups cannot erase it
+          set -o pipefail
+          make -j$(nproc --all) O=out \
+            ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            CONFIG_NO_ERROR_ON_MISMATCH=y \
+            KCFLAGS="-Wno-error" \
+            Image.gz-dtb 2>&1 | tee "$GITHUB_WORKSPACE/build_error.log"
 
       - name: Print Exact Error Lines If Build Fails
         if: failure()
-        working-directory: ./kernel
         run: |
-          if [ -f "build_error.log" ]; then
-            grep -iE "error:|undefined reference|fatal error:" build_error.log | tail -n 50 || tail -n 80 build_error.log
-          else
-            echo "No build_error.log found."
+          if [ -f "$GITHUB_WORKSPACE/build_error.log" ]; then
+            echo "================ EXACT COMPILER ERRORS ================"
+            grep -iE "error:|fatal error:|undefined reference" "$GITHUB_WORKSPACE/build_error.log" | tail -n 50 || tail -n 80 "$GITHUB_WORKSPACE/build_error.log"
           fi
 
       - name: Package AnyKernel3
